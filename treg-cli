@@ -1,0 +1,238 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# treg-cli: thin JSON client for https://treg.to (pay-per-call catalog of data APIs).
+# Reads TREG_TOKEN from ~/tools/treg-cli/.env. No gems.
+
+require "json"
+require "net/http"
+require "uri"
+require "optparse"
+
+ROOT = File.dirname(File.realpath(__FILE__))
+DEFAULT_MAX_COST = "0.10"
+
+def load_env
+  path = File.join(ROOT, ".env")
+  return unless File.exist?(path)
+
+  File.readlines(path, chomp: true).each do |line|
+    next if line.strip.empty? || line.start_with?("#")
+
+    key, value = line.split("=", 2)
+    ENV[key.strip] ||= value.to_s.strip.delete_prefix('"').delete_suffix('"')
+  end
+end
+
+def out(data)
+  puts JSON.generate({ ok: true, data: data })
+  exit 0
+end
+
+def fail!(message, code = "ERROR", extra = {})
+  puts JSON.generate({ ok: false, error: message, code: code }.merge(extra))
+  exit 1
+end
+
+def base_url = ENV.fetch("TREG_BASE_URL", "https://treg.to")
+
+def token
+  ENV["TREG_TOKEN"].to_s.empty? ? fail!("TREG_TOKEN missing. Put it in #{ROOT}/.env", "NO_TOKEN") : ENV["TREG_TOKEN"]
+end
+
+def request(method, path, query: {}, body: nil, headers: {}, auth: true)
+  uri = URI.join(base_url, path)
+  pairs = URI.decode_www_form(uri.query.to_s) + query.flat_map { |k, v| Array(v).map { |x| [k.to_s, x.to_s] } }
+  uri.query = pairs.empty? ? nil : URI.encode_www_form(pairs)
+
+  klass = { "GET" => Net::HTTP::Get, "POST" => Net::HTTP::Post, "PUT" => Net::HTTP::Put,
+            "PATCH" => Net::HTTP::Patch, "DELETE" => Net::HTTP::Delete }.fetch(method.upcase) { fail!("bad method #{method}", "BAD_ARGS") }
+  req = klass.new(uri)
+  req["X-Treg-Token"] = token if auth
+  req["Accept"] = "application/json"
+  if body
+    req["Content-Type"] = "application/json"
+    req.body = body.is_a?(String) ? body : JSON.generate(body)
+  end
+  headers.each { |k, v| req[k] = v }
+
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = uri.scheme == "https"
+  http.read_timeout = 300
+  http.request(req)
+rescue SocketError, Errno::ECONNREFUSED, Net::OpenTimeout, Net::ReadTimeout => e
+  fail!("network error: #{e.message}", "NETWORK")
+end
+
+def parse(res)
+  JSON.parse(res.body.to_s)
+rescue JSON::ParserError
+  res.body.to_s
+end
+
+def api(method, path, **opts)
+  res = request(method, path, **opts)
+  body = parse(res)
+  unless res.code.to_i.between?(200, 299)
+    detail = body.is_a?(Hash) ? (body["detail"] || body) : body
+    fail!("HTTP #{res.code}: #{detail.is_a?(String) ? detail : JSON.generate(detail)}", "HTTP_#{res.code}")
+  end
+  body
+end
+
+def me = (@me ||= api("GET", "/auth/me"))
+
+def kv_pairs(list)
+  list.each_with_object({}) do |pair, h|
+    k, v = pair.split("=", 2)
+    fail!("expected key=value, got #{pair}", "BAD_ARGS") if v.nil?
+    (h[k] ||= []) << v
+  end
+end
+
+def read_data(arg)
+  return nil if arg.nil?
+  return File.read(arg[1..]) if arg.start_with?("@")
+  return $stdin.read if arg == "-"
+
+  arg
+end
+
+def compact_endpoint(ep)
+  obs = ep["observed"] || {}
+  {
+    id: ep["id"] || ep["endpoint_id"],
+    name: ep["name"],
+    summary: ep["summary"],
+    provider: ep["provider"],
+    method: ep["method"],
+    usd: ep.dig("cost", "usd"),
+    cost_type: ep.dig("cost", "type"),
+    cost_unit: ep.dig("cost", "unit"),
+    ok_rate: obs["ok_rate"],
+    samples: obs["samples"],
+    p50_ms: obs["p50_ms"],
+    added: ep["added"],
+    call: ep["call_template"]&.sub(/\Atreg call/, "treg-cli call")
+  }.compact
+end
+
+USAGE = <<~TXT
+  treg-cli: JSON client for treg.to (team set by TREG_TOKEN)
+
+  treg-cli whoami                          # email, team, role
+  treg-cli balance [--limit N]             # prepaid balance + recent ledger
+  treg-cli platforms                       # catalog shelves with endpoint counts
+  treg-cli search "job words" [-n N] [--new] [--full]
+  treg-cli get <endpoint-id>               # params, cost, reliability, sibling providers
+  treg-cli call <endpoint-id|url> [-q k=v]... [-d JSON|@file|-] [-X METHOD]
+           [--max-cost USD] [-H 'Name: value']... [--no-cache]
+  treg-cli calls [-n N] [--days N]         # audit log
+  treg-cli result <call-id>                # fetch a stored answer again (free)
+  treg-cli tools                           # the team's own registered tools
+  treg-cli request "capability"            # ask treg to add a missing tool
+  treg-cli raw <METHOD> <path> [-q k=v]... [-d JSON]
+
+  call caps spend at $#{DEFAULT_MAX_COST} per call unless --max-cost is set.
+TXT
+
+load_env
+cmd = ARGV.shift
+opts = { query: [], headers: [], limit: nil }
+parser = OptionParser.new do |o|
+  o.on("-q", "--query KV") { |v| opts[:query] << v }
+  o.on("-d", "--data DATA") { |v| opts[:data] = v }
+  o.on("-X", "--method M") { |v| opts[:method] = v }
+  o.on("-H", "--header H") { |v| opts[:headers] << v }
+  o.on("-n", "--limit N", Integer) { |v| opts[:limit] = v }
+  o.on("--days N", Integer) { |v| opts[:days] = v }
+  o.on("--max-cost USD") { |v| opts[:max_cost] = v }
+  o.on("--no-cache") { opts[:no_cache] = true }
+  o.on("--new") { opts[:new] = true }
+  o.on("--full") { opts[:full] = true }
+  o.on("-h", "--help") { puts USAGE; exit 0 }
+end
+begin
+  parser.parse!(ARGV)
+rescue OptionParser::ParseError => e
+  fail!(e.message, "BAD_ARGS")
+end
+
+case cmd
+when "whoami"
+  out(me.slice("email", "org", "org_id", "role"))
+
+when "balance"
+  out(api("GET", "/orgs/#{me['org_id']}/balance", query: { limit: opts[:limit] || 10 }))
+
+when "platforms"
+  data = api("GET", "/catalog/platforms", auth: false)
+  out(data["platforms"].map do |p|
+    p.slice("slug", "label", "category", "summary", "capabilities", "endpoints", "providers")
+     .merge("price_from_usd" => p.dig("price_from", "usd"))
+  end)
+
+when "search"
+  q = ARGV.join(" ")
+  query = { q: q, limit: opts[:limit] || 10 }
+  query.merge!(added_within_days: 30, sort: "newest") if opts[:new]
+  fail!("usage: treg-cli search \"what you want to do\"", "BAD_ARGS") if q.empty? && !opts[:new]
+  data = api("GET", "/catalog/search", query: query)
+  results = opts[:full] ? data["results"] : data["results"].map { |ep| compact_endpoint(ep) }
+  out({ query: q, total: data["total"], results: results, hints: data["hints"] }.compact)
+
+when "get"
+  id = ARGV.shift or fail!("usage: treg-cli get <endpoint-id>", "BAD_ARGS")
+  out(api("GET", "/catalog/endpoints/#{id}"))
+
+when "call"
+  target = ARGV.shift or fail!("usage: treg-cli call <endpoint-id|url> ...", "BAD_ARGS")
+  body = read_data(opts[:data])
+  method = (opts[:method] || (body ? "POST" : "GET")).upcase
+  headers = opts[:headers].to_h { |h| h.split(":", 2).map(&:strip) }
+  headers["X-Treg-Route-Max-Cost"] ||= opts[:max_cost] || DEFAULT_MAX_COST
+  headers["Cache-Control"] = "no-cache" if opts[:no_cache]
+  res = request(method, "/call/#{target}", query: kv_pairs(opts[:query]), body: body, headers: headers)
+  meta = {
+    http_status: res.code.to_i,
+    call_id: res["X-Treg-Call-Id"],
+    cost_usd: res["X-Treg-Cost-Micro"] && (res["X-Treg-Cost-Micro"].to_i / 1_000_000.0),
+    served_by: res["X-Treg-Served-By"],
+    cache: res["X-Treg-Cache"],
+    async: res["X-Treg-Async"] && (JSON.parse(res["X-Treg-Async"]) rescue res["X-Treg-Async"])
+  }.compact
+  body = parse(res)
+  if res.code.to_i.between?(200, 299)
+    out({ result: body, treg: meta })
+  else
+    fail!("HTTP #{res.code} from #{target}", "HTTP_#{res.code}", { result: body, treg: meta })
+  end
+
+when "calls"
+  query = { limit: opts[:limit] || 20 }
+  query[:days] = opts[:days] if opts[:days]
+  out(api("GET", "/calls", query: query))
+
+when "result"
+  id = ARGV.shift or fail!("usage: treg-cli result <call-id>", "BAD_ARGS")
+  out(api("GET", "/calls/#{id}/result"))
+
+when "tools"
+  out(api("GET", "/tools"))
+
+when "request"
+  cap = ARGV.join(" ")
+  fail!("usage: treg-cli request \"what you need\"", "BAD_ARGS") if cap.empty?
+  out(api("POST", "/tool-requests", body: { capability: cap }))
+
+when "raw"
+  method = ARGV.shift or fail!("usage: treg-cli raw <METHOD> <path>", "BAD_ARGS")
+  path = ARGV.shift or fail!("usage: treg-cli raw <METHOD> <path>", "BAD_ARGS")
+  out(api(method, path, query: kv_pairs(opts[:query]), body: read_data(opts[:data])))
+
+when nil, "help", "-h", "--help"
+  puts USAGE
+
+else
+  fail!("unknown command: #{cmd}. Run treg-cli help", "BAD_ARGS")
+end
